@@ -21,14 +21,14 @@ HEADERS = {
                    "Chrome/122.0.0.0 Safari/537.36")
 }
 TIMEOUT = 30
-INVISIBLE = "\u2063"  # zero-width char so a message can have no visible text
+INVISIBLE = "\u2063"  # zero-width char (lets us send messages with no visible caption)
 
 # ---------- URL patterns ----------
 LINKSHORTIFY_RE = re.compile(r"https?://(?:www\.)?linkshortify\.com/full\?[^ \n]+", re.I)
 TEJTIME_RE      = re.compile(r"https?://(?:www\.)?info\.tejtime24\.com/[^ \n]+", re.I)
 LKSFY_RE        = re.compile(r"https?://(?:www\.)?lksfy\.com/[^ \n]+", re.I)
 
-# Episode label detector (e.g., "Episode 01-06", "Ep 7–12", "E03", optional "Season x")
+# Episode label detector, e.g., "Episode 01-06", "Ep 7–12", "E03", optional "Season x"
 EP_LABEL_RE = re.compile(
     r"(?:season\s*\d+\s*)?(?:episodes?|ep|e)\s*\d+(?:\s*[-–—]\s*\d+)?",
     re.I
@@ -123,26 +123,29 @@ def _clean_tg_url(u: str) -> str | None:
     return m.group(1) if m else None
 
 def _clean_drive_url(u: str) -> str | None:
+    # Accept common Google Drive/doc variants
     m = re.match(
         r'^\s*(https://(?:drive\.google\.com|docs\.google\.com|drive\.usercontent\.google\.com)/[^\s"\'<>]+)',
         u, re.I
     )
     return m.group(1) if m else None
 
-def extract_labeled_links(page_url: str) -> dict[str, dict[str, list[str]]]:
+def extract_title_and_labeled_links(page_url: str) -> tuple[str, dict[str, dict[str, list[str]]]]:
     """
-    Return { episode_label: { "tg": [...], "drive": [...] } }, using only <a href="...">.
+    Return (page_title, { episode_label: { "tg":[...], "drive":[...] } }).
+    Only uses <a href="...">; clean + dedupe.
     """
     r = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
+
+    title = _collapse_spaces(getattr(getattr(soup, "title", None), "string", "") or "") or "All Links"
 
     grouped: dict[str, dict[str, list[str]]] = {}
     seen_tg, seen_drive = set(), set()
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-
         tg = _clean_tg_url(href)
         gd = _clean_drive_url(href)
         if not tg and not gd:
@@ -158,16 +161,17 @@ def extract_labeled_links(page_url: str) -> dict[str, dict[str, list[str]]]:
             seen_drive.add(gd)
             slot["drive"].append(gd)
 
-    return grouped
+    return (title, grouped)
 
 def _label_sort_key(label: str):
     nums = re.findall(r"\d+", label)
     return int(nums[0]) if nums else 10**9
 
-def extract_labeled_from_any_input(url: str) -> tuple[str, dict[str, dict[str, list[str]]]]:
+def extract_everything_from_any_input(url: str) -> tuple[str, str, dict[str, dict[str, list[str]]]]:
     """
-    Resolve linkshortify/tejtime/lksfy -> final page URL, then extract grouped TG + Drive links.
-    Returns: (final_page_url_or_error_text, {label: {"tg":[...], "drive":[...]}})
+    Resolve linkshortify/tejtime/lksfy -> final page URL,
+    then extract page title + grouped TG/Drive links.
+    Returns: (final_page_url_or_error_text, page_title_or_default, grouped)
     """
     url = url.strip()
     try:
@@ -184,22 +188,31 @@ def extract_labeled_from_any_input(url: str) -> tuple[str, dict[str, dict[str, l
         else:
             raise ValueError("Please send a linkshortify / tejtime24 / lksfy URL.")
     except Exception as e:
-        return (f"[ERROR] {e}", {})
+        return (f"[ERROR] {e}", "All Links", {})
 
     if isinstance(final_page, str) and "message" in final_page.lower():
-        return (f"[BYPASS API] {final_page}", {})
+        return (f"[BYPASS API] {final_page}", "All Links", {})
 
     try:
-        grouped = extract_labeled_links(final_page)
-        return (final_page, grouped)
+        title, grouped = extract_title_and_labeled_links(final_page)
+        return (final_page, title, grouped)
     except Exception as e:
-        return (f"[ERROR extracting links] {e}", {})
+        return (f"[ERROR extracting links] {e}", "All Links", {})
+
+def _abbr_label(label: str) -> str:
+    """Turn 'Episode 01-06' -> 'E01-06', 'Episode 37' -> 'E37', etc."""
+    m = re.search(r'(?:episode|ep|e)\s*(\d+)(?:\s*[-–—]\s*(\d+))?', label, re.I)
+    if not m:
+        return label
+    a = int(m.group(1))
+    b = m.group(2)
+    return f"E{a:02d}-{int(b):02d}" if b else f"E{a:02d}"
 
 # ---------- Bot handlers ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send a linkshortify / tejtime24 / lksfy link.\n"
-        "Per episode I’ll send ONLY Telegram buttons; if no TG exists, I’ll send Drive buttons."
+        "I’ll return ALL Telegram + Drive links as buttons under ONE caption."
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,32 +233,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.chat.send_action("typing")
 
-    final_page, grouped = await asyncio.to_thread(extract_labeled_from_any_input, url)
+    final_page, title, grouped = await asyncio.to_thread(extract_everything_from_any_input, url)
 
     if not grouped:
         await update.message.reply_text(final_page)
         return
 
-    # Prefer TG; if none for that episode, fall back to Drive. Buttons-only, caption=episode.
-    MAX_ROWS = 25
+    # Build ONE keyboard with all links (TG first per episode, then Drive),
+    # button text includes episode tag to keep context (e.g., "E37 • TG 1")
+    buttons = []
     for label in sorted(grouped.keys(), key=_label_sort_key):
         slot = grouped[label]
-        urls = slot["tg"] if slot["tg"] else slot["drive"]
-        if not urls:
-            continue
+        tag = _abbr_label(label)
 
-        kind = "TG" if slot["tg"] else "Drive"
-        buttons = [InlineKeyboardButton(f"{kind} {i}", url=u) for i, u in enumerate(urls, 1)]
-        rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+        # TG first
+        for i, u in enumerate(slot.get("tg", []), 1):
+            buttons.append(InlineKeyboardButton(f"{tag} • TG {i}", url=u))
+        # then Drive
+        for i, u in enumerate(slot.get("drive", []), 1):
+            buttons.append(InlineKeyboardButton(f"{tag} • Drive {i}", url=u))
 
-        for i in range(0, len(rows), MAX_ROWS):
-            kb = InlineKeyboardMarkup(rows[i:i+MAX_ROWS])
-            cap = f"<b>{label}</b>" if i == 0 else INVISIBLE
-            await update.message.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+    if not buttons:
+        await update.message.reply_text("No Telegram/Drive links found.")
+        return
+
+    # Split into multiple messages if too many rows (2 buttons/row)
+    rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+    MAX_ROWS = 25
+    for i in range(0, len(rows), MAX_ROWS):
+        kb = InlineKeyboardMarkup(rows[i:i+MAX_ROWS])
+        cap = f"<b>{title}</b>" if i == 0 else INVISIBLE  # ONE caption only
+        await update.message.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 # ---------- Error/webhook handling ----------
 async def on_startup(app):
-    # Make sure polling isn't killed by an old webhook
+    # Ensure polling isn't killed by an old webhook
     await app.bot.delete_webhook(drop_pending_updates=True)
 
 async def error_handler(update, context):
