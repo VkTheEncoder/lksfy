@@ -6,6 +6,9 @@ from urllib.parse import urlparse, parse_qs, urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from telegram.constants import ParseMode
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+import html
 
 from telegram import Update
 from telegram.ext import (
@@ -57,6 +60,14 @@ def extract_id_from_url(u: str, body: str = "") -> str | None:
 
     return None
 
+def _clean_tg_url(u: str) -> str | None:
+    """
+    Keep only the URL part, strip trailing quotes/tags/spaces.
+    Accepts https://t.me/... or tg://...
+    """
+    m = re.match(r'^\s*(https://t\.me/[^\s"\'<>]+|tg://[^\s"\'<>]+)', u, re.I)
+    return m.group(1) if m else None
+
 def linkshortify_to_lksfy(start_url: str) -> str:
     """Follow linkshortify -> tejtime24 and build lksfy URL."""
     r = requests.get(start_url, headers=HEADERS, allow_redirects=True, timeout=TIMEOUT)
@@ -66,25 +77,43 @@ def linkshortify_to_lksfy(start_url: str) -> str:
         raise ValueError("Could not find ?id=… in redirected page.")
     return f"https://lksfy.com/{lid}"
 
+def _render_links_html(urls: list[str]) -> str:
+    """
+    Pretty HTML list like:
+    <b>Telegram Links (N)</b>
+    1. <a href="...">TG 1</a>
+    2. <a href="...">TG 2</a>
+    """
+    lines = [f"<b>Telegram Links ({len(urls)})</b>"]
+    for i, u in enumerate(urls, 1):
+        # escape only text, keep URL raw for <a href="">
+        lines.append(f'{i}. <a href="{u}">TG {i}</a>')
+    return "\n".join(lines)
+
+
 def extract_tg_links(page_url: str) -> list[str]:
-    """Return only Telegram links from the final page."""
+    """
+    Extract ONLY Telegram links from real <a href="..."> tags.
+    Returns a de-duplicated, cleaned list preserving order.
+    """
     r = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
-
-    links = set()
-
-    # 1) find in raw HTML (covers cases where links are not inside <a>)
-    for m in TG_RE.finditer(r.text):
-        links.add(m.group(1))
-
-    # 2) find inside anchors (more reliable/clean)
     soup = BeautifulSoup(r.text, "html.parser")
+
+    out, seen = [], set()
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if href.startswith("https://t.me/") or href.startswith("tg://"):
-            links.add(href)
+        clean = _clean_tg_url(href)
+        if not clean:
+            continue
+        if clean not in seen:
+            seen.add(clean)
+            out.append(clean)
+    return out
 
-    return sorted(links)
+def _chunk(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i+size]
 
 def extract_tg_from_any_input(url: str) -> list[str]:
     """
@@ -145,39 +174,70 @@ def _pick_first_url(text: str) -> str | None:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
+
     text = update.message.text.strip()
 
-    url = _pick_first_url(text)
+    # pick one supported URL from the message
+    url = None
+    for rx in (LINKSHORTIFY_RE, TEJTIME_RE, LKSFY_RE):
+        m = rx.search(text)
+        if m:
+            url = m.group(0)
+            break
     if not url:
-        await update.message.reply_text("Please send a valid linkshortify / tejtime24 / lksfy URL.")
+        await update.message.reply_text(
+            "Please send a valid linkshortify / tejtime24 / lksfy URL."
+        )
         return
 
     await update.message.chat.send_action("typing")
 
-    # run the heavy work off the main loop
+    # run resolution off the event loop
     tg_links = await asyncio.to_thread(extract_tg_from_any_input, url)
 
+    # Surface errors nicely
     if not tg_links:
         await update.message.reply_text("No Telegram links found.")
         return
-
-    # If only one string and it’s an error, show directly
     if len(tg_links) == 1 and tg_links[0].startswith("["):
         await update.message.reply_text(tg_links[0])
         return
 
-    # Compose response (split if very long)
-    msg = "Telegram Links Found:\n" + "\n".join(tg_links)
-    if len(msg) <= 4000:
-        await update.message.reply_text(msg)
+    # 1) Send a clean HTML list
+    html_msg = _render_links_html(tg_links)
+    # Telegram hard limit is ~4096 chars for text
+    if len(html_msg) <= 4096:
+        await update.message.reply_text(html_msg, parse_mode=ParseMode.HTML)
     else:
-        # Too long → send as a text file
-        tmp = "tg_links.txt"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write("\n".join(tg_links))
-        await update.message.reply_document(document=open(tmp, "rb"))
-        os.remove(tmp)
+        # split into multiple messages if needed
+        chunks = []
+        cur = []
+        cur_len = 0
+        for i, u in enumerate(tg_links, 1):
+            line = f'{i}. <a href="{u}">TG {i}</a>'
+            if (cur_len + len(line) + 1) > 3800:  # keep some buffer
+                chunks.append("\n".join(cur))
+                cur, cur_len = [], 0
+            cur.append(line)
+            cur_len += len(line) + 1
+        if cur:
+            chunks.append("\n".join(cur))
 
+        await update.message.reply_text(
+            f"<b>Telegram Links ({len(tg_links)})</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        for c in chunks:
+            await update.message.reply_text(c, parse_mode=ParseMode.HTML)
+
+    # 2) Also send Inline Keyboard buttons (clean + professional)
+    #    Telegram allows up to 8 buttons per row; we’ll do 2 per row.
+    rows = []
+    for pair in _chunk(tg_links, 2):
+        rows.append([InlineKeyboardButton(f"TG {i+1+len(rows)*2}", url=u)
+                     for i, u in enumerate(pair)])
+    kb = InlineKeyboardMarkup(rows)
+    await update.message.reply_text("Quick access:", reply_markup=kb)
 # ---------- Entrypoint ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
