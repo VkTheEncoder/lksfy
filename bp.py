@@ -1,3 +1,4 @@
+# bot.py
 import os
 import re
 import json
@@ -6,14 +7,11 @@ from urllib.parse import urlparse, parse_qs, urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from telegram.constants import ParseMode
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-import html
-
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 )
+from telegram.constants import ParseMode
 
 # ---------- HTTP config ----------
 HEADERS = {
@@ -28,9 +26,15 @@ LINKSHORTIFY_RE = re.compile(r"https?://(?:www\.)?linkshortify\.com/full\?[^ \n]
 TEJTIME_RE      = re.compile(r"https?://(?:www\.)?info\.tejtime24\.com/[^ \n]+", re.I)
 LKSFY_RE        = re.compile(r"https?://(?:www\.)?lksfy\.com/[^ \n]+", re.I)
 
-TG_RE = re.compile(r"(https://t\.me/[^\s]+|tg://[^\s]+)", re.I)
+# Episode label detector: "Episode 01-06", "Ep 7–12", "E03", optionally with "Season x"
+EP_LABEL_RE = re.compile(
+    r"(?:season\s*\d+\s*)?(?:episodes?|ep|e)\s*\d+(?:\s*[-–—]\s*\d+)?",
+    re.I
+)
 
-# ---------- Core helpers (your logic) ----------
+INVISIBLE = "\u2063"  # zero-width char so the message has no visible text
+
+# ---------- Core helpers ----------
 def uni(url: str) -> str:
     """Bypass lksfy shortlink -> return final page URL using your API."""
     res = requests.post(
@@ -60,14 +64,6 @@ def extract_id_from_url(u: str, body: str = "") -> str | None:
 
     return None
 
-def _clean_tg_url(u: str) -> str | None:
-    """
-    Keep only the URL part, strip trailing quotes/tags/spaces.
-    Accepts https://t.me/... or tg://...
-    """
-    m = re.match(r'^\s*(https://t\.me/[^\s"\'<>]+|tg://[^\s"\'<>]+)', u, re.I)
-    return m.group(1) if m else None
-
 def linkshortify_to_lksfy(start_url: str) -> str:
     """Follow linkshortify -> tejtime24 and build lksfy URL."""
     r = requests.get(start_url, headers=HEADERS, allow_redirects=True, timeout=TIMEOUT)
@@ -77,54 +73,105 @@ def linkshortify_to_lksfy(start_url: str) -> str:
         raise ValueError("Could not find ?id=… in redirected page.")
     return f"https://lksfy.com/{lid}"
 
-def _render_links_html(urls: list[str]) -> str:
+def _clean_tg_url(u: str) -> str | None:
     """
-    Pretty HTML list like:
-    <b>Telegram Links (N)</b>
-    1. <a href="...">TG 1</a>
-    2. <a href="...">TG 2</a>
+    Keep only the URL part, strip trailing quotes/tags/spaces.
+    Accepts https://t.me/... or tg://...
     """
-    lines = [f"<b>Telegram Links ({len(urls)})</b>"]
-    for i, u in enumerate(urls, 1):
-        # escape only text, keep URL raw for <a href="">
-        lines.append(f'{i}. <a href="{u}">TG {i}</a>')
-    return "\n".join(lines)
+    m = re.match(r'^\s*(https://t\.me/[^\s"\'<>]+|tg://[^\s"\'<>]+)', u, re.I)
+    return m.group(1) if m else None
 
+def _collapse_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
-def extract_tg_links(page_url: str) -> list[str]:
+def _guess_label_for_anchor(a_tag) -> str:
     """
-    Extract ONLY Telegram links from real <a href="..."> tags.
-    Returns a de-duplicated, cleaned list preserving order.
+    Find a human label (e.g., "Episode 01-06") close to the anchor:
+      - anchor text
+      - previous siblings
+      - parents (up 4 levels)
+      - previous siblings of those parents
+    """
+    # 1) anchor text
+    txt = _collapse_spaces(a_tag.get_text(" ", strip=True))
+    m = EP_LABEL_RE.search(txt)
+    if m:
+        return _collapse_spaces(m.group(0)).title()
+
+    # 2) walk previous siblings (few hops)
+    prev = a_tag
+    for _ in range(8):
+        prev = getattr(prev, "previous_sibling", None)
+        if not prev:
+            break
+        if hasattr(prev, "get_text"):
+            t2 = _collapse_spaces(prev.get_text(" ", strip=True))
+            m2 = EP_LABEL_RE.search(t2)
+            if m2:
+                return _collapse_spaces(m2.group(0)).title()
+
+    # 3) climb parents and check their text + nearby previous siblings
+    node = a_tag
+    for _ in range(4):
+        node = getattr(node, "parent", None)
+        if not node:
+            break
+        if hasattr(node, "get_text"):
+            t3 = _collapse_spaces(node.get_text(" ", strip=True))
+            m3 = EP_LABEL_RE.search(t3)
+            if m3:
+                return _collapse_spaces(m3.group(0)).title()
+        # prev siblings of this parent
+        ps = getattr(node, "previous_sibling", None)
+        hops = 0
+        while ps and hops < 6:
+            if hasattr(ps, "get_text"):
+                t4 = _collapse_spaces(ps.get_text(" ", strip=True))
+                m4 = EP_LABEL_RE.search(t4)
+                if m4:
+                    return _collapse_spaces(m4.group(0)).title()
+            ps = getattr(ps, "previous_sibling", None)
+            hops += 1
+
+    return "Episode ?"
+
+def extract_labeled_tg_links(page_url: str) -> dict[str, list[str]]:
+    """
+    Parse the final page and return {label: [tg links]}.
+    Uses only real <a href="..."> to avoid messy tails like '">TG'.
     """
     r = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    out, seen = [], set()
+    grouped: dict[str, list[str]] = {}
+    seen_global = set()
+
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         clean = _clean_tg_url(href)
         if not clean:
             continue
-        if clean not in seen:
-            seen.add(clean)
-            out.append(clean)
-    return out
+        if clean in seen_global:
+            continue
+        seen_global.add(clean)
 
-def _chunk(lst, size):
-    for i in range(0, len(lst), size):
-        yield lst[i:i+size]
+        label = _guess_label_for_anchor(a)
+        grouped.setdefault(label, []).append(clean)
 
-def extract_tg_from_any_input(url: str) -> list[str]:
+    return grouped
+
+def _label_sort_key(label: str):
+    # sort by first number in label; unknown at the end
+    nums = re.findall(r"\d+", label)
+    return int(nums[0]) if nums else 10**9
+
+def extract_labeled_tg_from_any_input(url: str) -> tuple[str, dict[str, list[str]]]:
     """
-    Accepts:
-      - linkshortify URL   -> linkshortify_to_lksfy -> uni -> final page -> TG links
-      - tejtime24 URL      -> lksfy(id from URL)     -> uni -> final page -> TG links
-      - lksfy URL          -> uni -> final page -> TG links
-    Returns list of TG links (may be empty).
+    Resolve linkshortify/tejtime/lksfy -> final page URL, then extract grouped TG links.
+    Returns: (final_page_url_or_error_text, {label: [links]})
     """
     url = url.strip()
-
     try:
         if LINKSHORTIFY_RE.match(url):
             lksfy = linkshortify_to_lksfy(url)
@@ -137,42 +184,27 @@ def extract_tg_from_any_input(url: str) -> list[str]:
         elif LKSFY_RE.match(url):
             final_page = uni(url)
         else:
-            # Not a supported starting URL
             raise ValueError("Please send a linkshortify / tejtime24 / lksfy URL.")
     except Exception as e:
-        # Surface the error in the bot response
-        return [f"[ERROR] {e}"]
+        return (f"[ERROR] {e}", {})
 
     # If bypass API returned an error message string
     if isinstance(final_page, str) and "message" in final_page.lower():
-        return [f"[BYPASS API] {final_page}"]
+        return (f"[BYPASS API] {final_page}", {})
 
     try:
-        tg_links = extract_tg_links(final_page)
-        return tg_links
+        grouped = extract_labeled_tg_links(final_page)
+        return (final_page, grouped)
     except Exception as e:
-        return [f"[ERROR extracting TG links] {e}"]
+        return (f"[ERROR extracting TG links] {e}", {})
 
 # ---------- Bot handlers ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send me a linkshortify / tejtime24 / lksfy link and I’ll return only the Telegram links.\n"
-        "Example:\n"
+        "Send a linkshortify / tejtime24 / lksfy link and I’ll return Telegram links, "
+        "grouped by episode, as buttons only.\n\nExample:\n"
         "https://linkshortify.com/full?api=...&enc=1"
     )
-
-def _pick_first_url(text: str) -> str | None:
-    # Prefer one of the supported hosts; fall back to any URL-like thing
-    for rx in (LINKSHORTIFY_RE, TEJTIME_RE, LKSFY_RE):
-        m = rx.search(text)
-        if m:
-            return m.group(0)
-    # Generic fallback
-    m = re.search(r"https?://[^\s]+", text)
-    return m.group(0) if m else None
-
-
-INVISIBLE = "\u2063"  # zero-width char so the message has no visible text
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -192,24 +224,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.chat.send_action("typing")
 
-    tg_links = await asyncio.to_thread(extract_tg_from_any_input, url)
+    final_page, grouped = await asyncio.to_thread(extract_labeled_tg_from_any_input, url)
 
-    # errors / empty
-    if not tg_links:
-        await update.message.reply_text("No Telegram links found.")
-        return
-    if len(tg_links) == 1 and tg_links[0].startswith("["):
-        await update.message.reply_text(tg_links[0])
+    # error surfaced
+    if not grouped:
+        await update.message.reply_text(final_page)
         return
 
-    # build buttons only (2 per row)
-    buttons = [InlineKeyboardButton(f"TG {i}", url=u)
-               for i, u in enumerate(tg_links, 1)]
-    rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
-    kb = InlineKeyboardMarkup(rows)
+    # Send one message per label with inline buttons (2 per row), caption = label only
+    for label in sorted(grouped.keys(), key=_label_sort_key):
+        urls = grouped[label]
+        buttons = [InlineKeyboardButton(f"TG {i}", url=u) for i, u in enumerate(urls, 1)]
+        rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
 
-    # send ONLY buttons (no list text)
-    await update.message.reply_text(INVISIBLE, reply_markup=kb)
+        # Telegram keyboards can get big; if too many rows, split across messages
+        MAX_ROWS = 25
+        for i in range(0, len(rows), MAX_ROWS):
+            kb = InlineKeyboardMarkup(rows[i:i+MAX_ROWS])
+            cap = f"<b>{label}</b>" if i == 0 else INVISIBLE  # label only on first block
+            await update.message.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+
 # ---------- Entrypoint ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
