@@ -171,10 +171,12 @@ def _pick_first_url(text: str) -> str | None:
     m = re.search(r"https?://[^\s]+", text)
     return m.group(0) if m else None
 
+
+INVISIBLE = "\u2063"  # zero-width char so the message has no visible text
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
     text = update.message.text.strip()
 
     # pick one supported URL from the message
@@ -185,17 +187,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             url = m.group(0)
             break
     if not url:
-        await update.message.reply_text(
-            "Please send a valid linkshortify / tejtime24 / lksfy URL."
-        )
+        await update.message.reply_text("Please send a valid linkshortify / tejtime24 / lksfy URL.")
         return
 
     await update.message.chat.send_action("typing")
 
-    # run resolution off the event loop
     tg_links = await asyncio.to_thread(extract_tg_from_any_input, url)
 
-    # Surface errors nicely
+    # errors / empty
     if not tg_links:
         await update.message.reply_text("No Telegram links found.")
         return
@@ -203,41 +202,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(tg_links[0])
         return
 
-    # 1) Send a clean HTML list
-    html_msg = _render_links_html(tg_links)
-    # Telegram hard limit is ~4096 chars for text
-    if len(html_msg) <= 4096:
-        await update.message.reply_text(html_msg, parse_mode=ParseMode.HTML)
-    else:
-        # split into multiple messages if needed
-        chunks = []
-        cur = []
-        cur_len = 0
-        for i, u in enumerate(tg_links, 1):
-            line = f'{i}. <a href="{u}">TG {i}</a>'
-            if (cur_len + len(line) + 1) > 3800:  # keep some buffer
-                chunks.append("\n".join(cur))
-                cur, cur_len = [], 0
-            cur.append(line)
-            cur_len += len(line) + 1
-        if cur:
-            chunks.append("\n".join(cur))
-
-        await update.message.reply_text(
-            f"<b>Telegram Links ({len(tg_links)})</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        for c in chunks:
-            await update.message.reply_text(c, parse_mode=ParseMode.HTML)
-
-    # 2) Also send Inline Keyboard buttons (clean + professional)
-    #    Telegram allows up to 8 buttons per row; we’ll do 2 per row.
-    rows = []
-    for pair in _chunk(tg_links, 2):
-        rows.append([InlineKeyboardButton(f"TG {i+1+len(rows)*2}", url=u)
-                     for i, u in enumerate(pair)])
+    # build buttons only (2 per row)
+    buttons = [InlineKeyboardButton(f"TG {i}", url=u)
+               for i, u in enumerate(tg_links, 1)]
+    rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
     kb = InlineKeyboardMarkup(rows)
-    await update.message.reply_text("Quick access:", reply_markup=kb)
+
+    # send ONLY buttons (no list text)
+    await update.message.reply_text(INVISIBLE, reply_markup=kb)
 # ---------- Entrypoint ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
