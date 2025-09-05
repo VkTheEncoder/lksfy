@@ -1,23 +1,43 @@
-import json
+import os
 import re
+import json
+import asyncio
 from urllib.parse import urlparse, parse_qs, urljoin
+
 import requests
 from bs4 import BeautifulSoup
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+)
 
+# ---------- HTTP config ----------
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/122.0.0.0 Safari/537.36")
+}
+TIMEOUT = 30
+
+# ---------- URL patterns ----------
+LINKSHORTIFY_RE = re.compile(r"https?://(?:www\.)?linkshortify\.com/full\?[^ \n]+", re.I)
+TEJTIME_RE      = re.compile(r"https?://(?:www\.)?info\.tejtime24\.com/[^ \n]+", re.I)
+LKSFY_RE        = re.compile(r"https?://(?:www\.)?lksfy\.com/[^ \n]+", re.I)
+
+TG_RE = re.compile(r"(https://t\.me/[^\s]+|tg://[^\s]+)", re.I)
+
+# ---------- Core helpers (your logic) ----------
 def uni(url: str) -> str:
-    """Bypass lksfy shortlink -> return final URL."""
+    """Bypass lksfy shortlink -> return final page URL using your API."""
     res = requests.post(
         "https://freeseptemberapi.vercel.app/bypass",
         json={"url": url},
         headers=HEADERS,
-        timeout=30,
+        timeout=TIMEOUT,
     )
     data = res.text
+    # If API returns an error JSON/Text containing "message", pass it back
     if "message" in data:
         return data
     return json.loads(data)["url"]
@@ -38,40 +58,136 @@ def extract_id_from_url(u: str, body: str = "") -> str | None:
     return None
 
 def linkshortify_to_lksfy(start_url: str) -> str:
-    r = requests.get(start_url, headers=HEADERS, allow_redirects=True, timeout=30)
+    """Follow linkshortify -> tejtime24 and build lksfy URL."""
+    r = requests.get(start_url, headers=HEADERS, allow_redirects=True, timeout=TIMEOUT)
     final_url = r.url
     lid = extract_id_from_url(final_url, r.text)
     if not lid:
         raise ValueError("Could not find ?id=… in redirected page.")
     return f"https://lksfy.com/{lid}"
 
-def extract_tg_links(page_url: str):
-    res = requests.get(page_url, headers=HEADERS, timeout=30)
-    res.raise_for_status()
-    soup = BeautifulSoup(res.text, "html.parser")
+def extract_tg_links(page_url: str) -> list[str]:
+    """Return only Telegram links from the final page."""
+    r = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
 
-    tg_links = []
+    links = set()
+
+    # 1) find in raw HTML (covers cases where links are not inside <a>)
+    for m in TG_RE.finditer(r.text):
+        links.add(m.group(1))
+
+    # 2) find inside anchors (more reliable/clean)
+    soup = BeautifulSoup(r.text, "html.parser")
     for a in soup.find_all("a", href=True):
-        href = a["href"]
+        href = a["href"].strip()
         if href.startswith("https://t.me/") or href.startswith("tg://"):
-            tg_links.append(href)
+            links.add(href)
 
-    return tg_links
+    return sorted(links)
+
+def extract_tg_from_any_input(url: str) -> list[str]:
+    """
+    Accepts:
+      - linkshortify URL   -> linkshortify_to_lksfy -> uni -> final page -> TG links
+      - tejtime24 URL      -> lksfy(id from URL)     -> uni -> final page -> TG links
+      - lksfy URL          -> uni -> final page -> TG links
+    Returns list of TG links (may be empty).
+    """
+    url = url.strip()
+
+    try:
+        if LINKSHORTIFY_RE.match(url):
+            lksfy = linkshortify_to_lksfy(url)
+            final_page = uni(lksfy)
+        elif TEJTIME_RE.match(url):
+            lid = extract_id_from_url(url, "")
+            if not lid:
+                raise ValueError("Could not extract id from tejtime24 URL.")
+            final_page = uni(f"https://lksfy.com/{lid}")
+        elif LKSFY_RE.match(url):
+            final_page = uni(url)
+        else:
+            # Not a supported starting URL
+            raise ValueError("Please send a linkshortify / tejtime24 / lksfy URL.")
+    except Exception as e:
+        # Surface the error in the bot response
+        return [f"[ERROR] {e}"]
+
+    # If bypass API returned an error message string
+    if isinstance(final_page, str) and "message" in final_page.lower():
+        return [f"[BYPASS API] {final_page}"]
+
+    try:
+        tg_links = extract_tg_links(final_page)
+        return tg_links
+    except Exception as e:
+        return [f"[ERROR extracting TG links] {e}"]
+
+# ---------- Bot handlers ----------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Send me a linkshortify / tejtime24 / lksfy link and I’ll return only the Telegram links.\n"
+        "Example:\n"
+        "https://linkshortify.com/full?api=...&enc=1"
+    )
+
+def _pick_first_url(text: str) -> str | None:
+    # Prefer one of the supported hosts; fall back to any URL-like thing
+    for rx in (LINKSHORTIFY_RE, TEJTIME_RE, LKSFY_RE):
+        m = rx.search(text)
+        if m:
+            return m.group(0)
+    # Generic fallback
+    m = re.search(r"https?://[^\s]+", text)
+    return m.group(0) if m else None
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+
+    url = _pick_first_url(text)
+    if not url:
+        await update.message.reply_text("Please send a valid linkshortify / tejtime24 / lksfy URL.")
+        return
+
+    await update.message.chat.send_action("typing")
+
+    # run the heavy work off the main loop
+    tg_links = await asyncio.to_thread(extract_tg_from_any_input, url)
+
+    if not tg_links:
+        await update.message.reply_text("No Telegram links found.")
+        return
+
+    # If only one string and it’s an error, show directly
+    if len(tg_links) == 1 and tg_links[0].startswith("["):
+        await update.message.reply_text(tg_links[0])
+        return
+
+    # Compose response (split if very long)
+    msg = "Telegram Links Found:\n" + "\n".join(tg_links)
+    if len(msg) <= 4000:
+        await update.message.reply_text(msg)
+    else:
+        # Too long → send as a text file
+        tmp = "tg_links.txt"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(tg_links))
+        await update.message.reply_document(document=open(tmp, "rb"))
+        os.remove(tmp)
+
+# ---------- Entrypoint ----------
+def main():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable first.")
+
+    app = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.run_polling()
 
 if __name__ == "__main__":
-    # Step 1: Your starting linkshortify link
-    start_url = "https://linkshortify.com/full?api=8308c89feff85b167a3804f3e9c3cc716c235f49&url=031bb8c7ccabff5a70d2d8dfcd0afccdd2840a541c7c7bb958628089f6494e9f269187e8f5a3847a13ea6bd4563671c6&type=2&enc=1"
-
-    # Step 2: linkshortify -> lksfy
-    lksfy_url = linkshortify_to_lksfy(start_url)
-    print("lksfy URL:", lksfy_url)
-
-    # Step 3: bypass lksfy -> final page
-    final_url = uni(lksfy_url)
-    print("Final page URL:", final_url)
-
-    # Step 4: extract only Telegram links
-    tg_links = extract_tg_links(final_url)
-    print("\nTelegram Links Found:")
-    for link in tg_links:
-        print(link)
+    main()
