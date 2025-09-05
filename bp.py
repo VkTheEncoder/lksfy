@@ -12,6 +12,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 )
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 
 # ---------- HTTP config ----------
 HEADERS = {
@@ -78,13 +79,11 @@ def _guess_label_for_anchor(a_tag) -> str:
       - previous siblings
       - parents (up 4 levels) and their previous siblings
     """
-    # anchor text
     txt = _collapse_spaces(a_tag.get_text(" ", strip=True))
     m = EP_LABEL_RE.search(txt)
     if m:
         return _collapse_spaces(m.group(0)).title()
 
-    # previous siblings
     prev = a_tag
     for _ in range(8):
         prev = getattr(prev, "previous_sibling", None)
@@ -96,7 +95,6 @@ def _guess_label_for_anchor(a_tag) -> str:
             if m2:
                 return _collapse_spaces(m2.group(0)).title()
 
-    # climb parents
     node = a_tag
     for _ in range(4):
         node = getattr(node, "parent", None)
@@ -107,7 +105,6 @@ def _guess_label_for_anchor(a_tag) -> str:
             m3 = EP_LABEL_RE.search(t3)
             if m3:
                 return _collapse_spaces(m3.group(0)).title()
-        # previous siblings of parent
         ps = getattr(node, "previous_sibling", None)
         hops = 0
         while ps and hops < 6:
@@ -122,20 +119,10 @@ def _guess_label_for_anchor(a_tag) -> str:
     return "Episode ?"
 
 def _clean_tg_url(u: str) -> str | None:
-    # Accept https://t.me/... or tg://...
     m = re.match(r'^\s*(https://t\.me/[^\s"\'<>]+|tg://[^\s"\'<>]+)', u, re.I)
     return m.group(1) if m else None
 
 def _clean_drive_url(u: str) -> str | None:
-    """
-    Accept common Google Drive variants:
-      - https://drive.google.com/file/d/<id>/view...
-      - https://drive.google.com/open?id=<id>
-      - https://drive.google.com/uc?id=<id>&export=download
-      - https://drive.google.com/drive/folders/<id>
-      - https://docs.google.com/uc?export=download&id=<id>
-      - https://drive.usercontent.google.com/...
-    """
     m = re.match(
         r'^\s*(https://(?:drive\.google\.com|docs\.google\.com|drive\.usercontent\.google\.com)/[^\s"\'<>]+)',
         u, re.I
@@ -144,9 +131,7 @@ def _clean_drive_url(u: str) -> str | None:
 
 def extract_labeled_links(page_url: str) -> dict[str, dict[str, list[str]]]:
     """
-    Parse the final page and return:
-      { episode_label: { "tg": [...], "drive": [...] } }
-    Only uses real <a href="..."> attributes (clean & dedupe).
+    Return { episode_label: { "tg": [...], "drive": [...] } }, using only <a href="...">.
     """
     r = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
@@ -160,7 +145,6 @@ def extract_labeled_links(page_url: str) -> dict[str, dict[str, list[str]]]:
 
         tg = _clean_tg_url(href)
         gd = _clean_drive_url(href)
-
         if not tg and not gd:
             continue
 
@@ -170,7 +154,6 @@ def extract_labeled_links(page_url: str) -> dict[str, dict[str, list[str]]]:
         if tg and tg not in seen_tg:
             seen_tg.add(tg)
             slot["tg"].append(tg)
-
         if gd and gd not in seen_drive:
             seen_drive.add(gd)
             slot["drive"].append(gd)
@@ -203,7 +186,6 @@ def extract_labeled_from_any_input(url: str) -> tuple[str, dict[str, dict[str, l
     except Exception as e:
         return (f"[ERROR] {e}", {})
 
-    # bypass API error text
     if isinstance(final_page, str) and "message" in final_page.lower():
         return (f"[BYPASS API] {final_page}", {})
 
@@ -217,7 +199,7 @@ def extract_labeled_from_any_input(url: str) -> tuple[str, dict[str, dict[str, l
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send a linkshortify / tejtime24 / lksfy link.\n"
-        "I’ll return buttons grouped by episode for Telegram and Google Drive (if present)."
+        "Per episode I’ll send ONLY Telegram buttons; if no TG exists, I’ll send Drive buttons."
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,25 +226,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(final_page)
         return
 
-    # Send one (or two) messages per episode: TG buttons, Drive buttons
-    MAX_ROWS = 25  # keyboard chunking
+    # Prefer TG; if none for that episode, fall back to Drive. Buttons-only, caption=episode.
+    MAX_ROWS = 25
     for label in sorted(grouped.keys(), key=_label_sort_key):
         slot = grouped[label]
-        for kind in ("tg", "drive"):
-            urls = slot.get(kind, [])
-            if not urls:
-                continue
+        urls = slot["tg"] if slot["tg"] else slot["drive"]
+        if not urls:
+            continue
 
-            # Build buttons (2 per row), split if too many rows
-            buttons = [InlineKeyboardButton(f"{'TG' if kind=='tg' else 'Drive'} {i}", url=u)
-                       for i, u in enumerate(urls, 1)]
-            rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+        kind = "TG" if slot["tg"] else "Drive"
+        buttons = [InlineKeyboardButton(f"{kind} {i}", url=u) for i, u in enumerate(urls, 1)]
+        rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
 
-            for i in range(0, len(rows), MAX_ROWS):
-                kb = InlineKeyboardMarkup(rows[i:i+MAX_ROWS])
-                # Caption shows Episode label + link type on first chunk
-                cap = f"<b>{label} • {'Telegram' if kind=='tg' else 'Drive'}</b>" if i == 0 else INVISIBLE
-                await update.message.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+        for i in range(0, len(rows), MAX_ROWS):
+            kb = InlineKeyboardMarkup(rows[i:i+MAX_ROWS])
+            cap = f"<b>{label}</b>" if i == 0 else INVISIBLE
+            await update.message.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+# ---------- Error/webhook handling ----------
+async def on_startup(app):
+    # Make sure polling isn't killed by an old webhook
+    await app.bot.delete_webhook(drop_pending_updates=True)
+
+async def error_handler(update, context):
+    try:
+        raise context.error
+    except TelegramError as e:
+        print(f"[TelegramError] {e}")
+    except Exception as e:
+        print(f"[Unhandled] {e}")
 
 # ---------- Entrypoint ----------
 def main():
@@ -270,11 +262,17 @@ def main():
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable first.")
 
-    app = ApplicationBuilder().token(token).build()
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(on_startup)
+        .build()
+    )
+    app.add_error_handler(error_handler)
+
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
