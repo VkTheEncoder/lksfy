@@ -3,7 +3,7 @@ import os
 import re
 import json
 import asyncio
-from urllib.parse import urlparse, parse_qs, urljoin
+from urllib.parse import urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,19 +20,18 @@ HEADERS = {
                    "Chrome/122.0.0.0 Safari/537.36")
 }
 TIMEOUT = 30
+INVISIBLE = "\u2063"  # zero-width char so a message can have no visible text
 
 # ---------- URL patterns ----------
 LINKSHORTIFY_RE = re.compile(r"https?://(?:www\.)?linkshortify\.com/full\?[^ \n]+", re.I)
 TEJTIME_RE      = re.compile(r"https?://(?:www\.)?info\.tejtime24\.com/[^ \n]+", re.I)
 LKSFY_RE        = re.compile(r"https?://(?:www\.)?lksfy\.com/[^ \n]+", re.I)
 
-# Episode label detector: "Episode 01-06", "Ep 7–12", "E03", optionally with "Season x"
+# Episode label detector (e.g., "Episode 01-06", "Ep 7–12", "E03", optional "Season x")
 EP_LABEL_RE = re.compile(
     r"(?:season\s*\d+\s*)?(?:episodes?|ep|e)\s*\d+(?:\s*[-–—]\s*\d+)?",
     re.I
 )
-
-INVISIBLE = "\u2063"  # zero-width char so the message has no visible text
 
 # ---------- Core helpers ----------
 def uni(url: str) -> str:
@@ -44,7 +43,6 @@ def uni(url: str) -> str:
         timeout=TIMEOUT,
     )
     data = res.text
-    # If API returns an error JSON/Text containing "message", pass it back
     if "message" in data:
         return data
     return json.loads(data)["url"]
@@ -53,15 +51,12 @@ def extract_id_from_url(u: str, body: str = "") -> str | None:
     qs = parse_qs(urlparse(u).query)
     if "id" in qs and qs["id"]:
         return qs["id"][0]
-
     m = re.search(r"[?&]id=([A-Za-z0-9]+)", u)
     if m:
         return m.group(1)
-
     m = re.search(r"id=([A-Za-z0-9]+)", body)
     if m:
         return m.group(1)
-
     return None
 
 def linkshortify_to_lksfy(start_url: str) -> str:
@@ -73,14 +68,6 @@ def linkshortify_to_lksfy(start_url: str) -> str:
         raise ValueError("Could not find ?id=… in redirected page.")
     return f"https://lksfy.com/{lid}"
 
-def _clean_tg_url(u: str) -> str | None:
-    """
-    Keep only the URL part, strip trailing quotes/tags/spaces.
-    Accepts https://t.me/... or tg://...
-    """
-    m = re.match(r'^\s*(https://t\.me/[^\s"\'<>]+|tg://[^\s"\'<>]+)', u, re.I)
-    return m.group(1) if m else None
-
 def _collapse_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
@@ -89,16 +76,15 @@ def _guess_label_for_anchor(a_tag) -> str:
     Find a human label (e.g., "Episode 01-06") close to the anchor:
       - anchor text
       - previous siblings
-      - parents (up 4 levels)
-      - previous siblings of those parents
+      - parents (up 4 levels) and their previous siblings
     """
-    # 1) anchor text
+    # anchor text
     txt = _collapse_spaces(a_tag.get_text(" ", strip=True))
     m = EP_LABEL_RE.search(txt)
     if m:
         return _collapse_spaces(m.group(0)).title()
 
-    # 2) walk previous siblings (few hops)
+    # previous siblings
     prev = a_tag
     for _ in range(8):
         prev = getattr(prev, "previous_sibling", None)
@@ -110,7 +96,7 @@ def _guess_label_for_anchor(a_tag) -> str:
             if m2:
                 return _collapse_spaces(m2.group(0)).title()
 
-    # 3) climb parents and check their text + nearby previous siblings
+    # climb parents
     node = a_tag
     for _ in range(4):
         node = getattr(node, "parent", None)
@@ -121,7 +107,7 @@ def _guess_label_for_anchor(a_tag) -> str:
             m3 = EP_LABEL_RE.search(t3)
             if m3:
                 return _collapse_spaces(m3.group(0)).title()
-        # prev siblings of this parent
+        # previous siblings of parent
         ps = getattr(node, "previous_sibling", None)
         hops = 0
         while ps and hops < 6:
@@ -135,41 +121,70 @@ def _guess_label_for_anchor(a_tag) -> str:
 
     return "Episode ?"
 
-def extract_labeled_tg_links(page_url: str) -> dict[str, list[str]]:
+def _clean_tg_url(u: str) -> str | None:
+    # Accept https://t.me/... or tg://...
+    m = re.match(r'^\s*(https://t\.me/[^\s"\'<>]+|tg://[^\s"\'<>]+)', u, re.I)
+    return m.group(1) if m else None
+
+def _clean_drive_url(u: str) -> str | None:
     """
-    Parse the final page and return {label: [tg links]}.
-    Uses only real <a href="..."> to avoid messy tails like '">TG'.
+    Accept common Google Drive variants:
+      - https://drive.google.com/file/d/<id>/view...
+      - https://drive.google.com/open?id=<id>
+      - https://drive.google.com/uc?id=<id>&export=download
+      - https://drive.google.com/drive/folders/<id>
+      - https://docs.google.com/uc?export=download&id=<id>
+      - https://drive.usercontent.google.com/...
+    """
+    m = re.match(
+        r'^\s*(https://(?:drive\.google\.com|docs\.google\.com|drive\.usercontent\.google\.com)/[^\s"\'<>]+)',
+        u, re.I
+    )
+    return m.group(1) if m else None
+
+def extract_labeled_links(page_url: str) -> dict[str, dict[str, list[str]]]:
+    """
+    Parse the final page and return:
+      { episode_label: { "tg": [...], "drive": [...] } }
+    Only uses real <a href="..."> attributes (clean & dedupe).
     """
     r = requests.get(page_url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    grouped: dict[str, list[str]] = {}
-    seen_global = set()
+    grouped: dict[str, dict[str, list[str]]] = {}
+    seen_tg, seen_drive = set(), set()
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        clean = _clean_tg_url(href)
-        if not clean:
+
+        tg = _clean_tg_url(href)
+        gd = _clean_drive_url(href)
+
+        if not tg and not gd:
             continue
-        if clean in seen_global:
-            continue
-        seen_global.add(clean)
 
         label = _guess_label_for_anchor(a)
-        grouped.setdefault(label, []).append(clean)
+        slot = grouped.setdefault(label, {"tg": [], "drive": []})
+
+        if tg and tg not in seen_tg:
+            seen_tg.add(tg)
+            slot["tg"].append(tg)
+
+        if gd and gd not in seen_drive:
+            seen_drive.add(gd)
+            slot["drive"].append(gd)
 
     return grouped
 
 def _label_sort_key(label: str):
-    # sort by first number in label; unknown at the end
     nums = re.findall(r"\d+", label)
     return int(nums[0]) if nums else 10**9
 
-def extract_labeled_tg_from_any_input(url: str) -> tuple[str, dict[str, list[str]]]:
+def extract_labeled_from_any_input(url: str) -> tuple[str, dict[str, dict[str, list[str]]]]:
     """
-    Resolve linkshortify/tejtime/lksfy -> final page URL, then extract grouped TG links.
-    Returns: (final_page_url_or_error_text, {label: [links]})
+    Resolve linkshortify/tejtime/lksfy -> final page URL, then extract grouped TG + Drive links.
+    Returns: (final_page_url_or_error_text, {label: {"tg":[...], "drive":[...]}})
     """
     url = url.strip()
     try:
@@ -188,22 +203,21 @@ def extract_labeled_tg_from_any_input(url: str) -> tuple[str, dict[str, list[str
     except Exception as e:
         return (f"[ERROR] {e}", {})
 
-    # If bypass API returned an error message string
+    # bypass API error text
     if isinstance(final_page, str) and "message" in final_page.lower():
         return (f"[BYPASS API] {final_page}", {})
 
     try:
-        grouped = extract_labeled_tg_links(final_page)
+        grouped = extract_labeled_links(final_page)
         return (final_page, grouped)
     except Exception as e:
-        return (f"[ERROR extracting TG links] {e}", {})
+        return (f"[ERROR extracting links] {e}", {})
 
 # ---------- Bot handlers ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send a linkshortify / tejtime24 / lksfy link and I’ll return Telegram links, "
-        "grouped by episode, as buttons only.\n\nExample:\n"
-        "https://linkshortify.com/full?api=...&enc=1"
+        "Send a linkshortify / tejtime24 / lksfy link.\n"
+        "I’ll return buttons grouped by episode for Telegram and Google Drive (if present)."
     )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,7 +225,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
 
-    # pick one supported URL from the message
+    # pick supported URL
     url = None
     for rx in (LINKSHORTIFY_RE, TEJTIME_RE, LKSFY_RE):
         m = rx.search(text)
@@ -224,25 +238,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.chat.send_action("typing")
 
-    final_page, grouped = await asyncio.to_thread(extract_labeled_tg_from_any_input, url)
+    final_page, grouped = await asyncio.to_thread(extract_labeled_from_any_input, url)
 
-    # error surfaced
     if not grouped:
         await update.message.reply_text(final_page)
         return
 
-    # Send one message per label with inline buttons (2 per row), caption = label only
+    # Send one (or two) messages per episode: TG buttons, Drive buttons
+    MAX_ROWS = 25  # keyboard chunking
     for label in sorted(grouped.keys(), key=_label_sort_key):
-        urls = grouped[label]
-        buttons = [InlineKeyboardButton(f"TG {i}", url=u) for i, u in enumerate(urls, 1)]
-        rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+        slot = grouped[label]
+        for kind in ("tg", "drive"):
+            urls = slot.get(kind, [])
+            if not urls:
+                continue
 
-        # Telegram keyboards can get big; if too many rows, split across messages
-        MAX_ROWS = 25
-        for i in range(0, len(rows), MAX_ROWS):
-            kb = InlineKeyboardMarkup(rows[i:i+MAX_ROWS])
-            cap = f"<b>{label}</b>" if i == 0 else INVISIBLE  # label only on first block
-            await update.message.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+            # Build buttons (2 per row), split if too many rows
+            buttons = [InlineKeyboardButton(f"{'TG' if kind=='tg' else 'Drive'} {i}", url=u)
+                       for i, u in enumerate(urls, 1)]
+            rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+
+            for i in range(0, len(rows), MAX_ROWS):
+                kb = InlineKeyboardMarkup(rows[i:i+MAX_ROWS])
+                # Caption shows Episode label + link type on first chunk
+                cap = f"<b>{label} • {'Telegram' if kind=='tg' else 'Drive'}</b>" if i == 0 else INVISIBLE
+                await update.message.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 # ---------- Entrypoint ----------
 def main():
@@ -257,3 +277,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
